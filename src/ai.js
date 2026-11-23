@@ -4,8 +4,7 @@ import fs from 'node:fs'
 const STATE_FILE = 'state.json'
 const claude = process.env.ANTHROPIC_API_KEY ? new Anthropic() : null
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-haiku-5-5'
-const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile'
-const GROQ_WEB_MODEL = process.env.GROQ_WEB_MODEL || 'groq/compound-mini' // tem pesquisa web incluída
+const GROQ_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-120b'
 
 export function loadState() {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) } catch { return {} }
@@ -39,17 +38,25 @@ async function askGroq(system, prompt, web) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
     body: JSON.stringify({
-      model: web ? GROQ_WEB_MODEL : GROQ_MODEL,
-      max_tokens: 1000,
+      model: GROQ_MODEL,
+      max_tokens: 2000,
+      tools: web ? [{ type: 'browser_search' }] : undefined,
       messages: [{ role: 'system', content: system }, { role: 'user', content: prompt }],
     }),
   })
   if (!res.ok) throw new Error(`Groq ${res.status}: ${await res.text()}`)
   const data = await res.json()
-  return data.choices[0].message.content.trim()
+  return data.choices[0].message.content.replace(/【[^】]*】/g, '').trim() // tira marcas de citação
 }
 
-export async function ask(system, prompt, { web = false } = {}) {
+// WhatsApp usa *negrito*, não **negrito**
+const toWhatsApp = t => t.replace(/\*\*(.+?)\*\*/g, '*$1*').replace(/^#+\s*/gm, '')
+
+export async function ask(system, prompt, opts) {
+  return toWhatsApp(await askAny(system, prompt, opts))
+}
+
+async function askAny(system, prompt, { web = false } = {}) {
   const state = loadState()
   if (claude && !state.claude_esgotado) {
     try {
