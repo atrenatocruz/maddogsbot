@@ -7,6 +7,7 @@ import makeWASocket, {
   areJidsSameUser, isJidGroup,
 } from '@whiskeysockets/baileys'
 import { ask, loadState, saveState } from './ai.js'
+import { procurar } from './historico.js'
 
 const GROUP_ID = process.env.GROUP_ID || ''
 const BOT_NAME = process.env.BOT_NAME || 'Bot'
@@ -30,7 +31,7 @@ const numberOf = jid => (jid || '').split('@')[0].split(':')[0]
 // Descobre quem é: 1) número já conhecido, 2) nome do WhatsApp (e memoriza o número)
 function findMember(perfis, msg) {
   const num = numberOf(msg.key.participantAlt || msg.key.participant)
-  let m = perfis.membros.find(p => p.numeros?.includes(num))
+  let m = perfis.membros.find(p => p.numeros?.map(String).includes(num))
   const contactos = readJson('data/contactos.json')
   if (!m && contactos[num]) m = perfis.membros.find(p => p.nome === contactos[num])
   if (m) return m
@@ -42,7 +43,9 @@ function findMember(perfis, msg) {
   }).sort((a, b) => b.score - a.score)
   if (scored[0]?.score > 0 && scored[0].score !== scored[1]?.score) {
     m = scored[0].p
-    fs.writeFileSync('data/contactos.json', JSON.stringify({ ...contactos, [num]: m.nome }, null, 2))
+    // guarda o número e o LID, para depois reconhecer @menções a esta pessoa
+    const keys = [num, numberOf(msg.key.participant)]
+    fs.writeFileSync('data/contactos.json', JSON.stringify({ ...contactos, ...Object.fromEntries(keys.map(k => [k, m.nome])) }, null, 2))
     console.log(`[perfis] ${msg.pushName} (${num}) → ${m.nome}`)
   } else {
     console.log(`[perfis] não reconheci ${msg.pushName} (${num}) — põe o número em "numeros" no perfis.json`)
@@ -50,6 +53,28 @@ function findMember(perfis, msg) {
   return m
 }
 function readJson(f) { try { return JSON.parse(fs.readFileSync(f, 'utf8')) } catch { return {} } }
+
+const isBot = (sock, j) => !!j && (areJidsSameUser(j, sock.user.id) || (sock.user.lid && areJidsSameUser(j, sock.user.lid)))
+
+// Troca "@351912345678" / "@2663391431" pelo nome da pessoa (ou do bot)
+async function resolveMentions(sock, text, ctx) {
+  const perfis = loadPerfis()
+  const contactos = readJson('data/contactos.json')
+  for (const j of ctx?.mentionedJid || []) {
+    const num = numberOf(j)
+    let nome = isBot(sock, j) ? BOT_NAME : null
+    if (!nome) {
+      const nums = [num]
+      if (j.endsWith('@lid')) {
+        const pn = await sock.signalRepository?.lidMapping?.getPNForLID(j).catch(() => null)
+        if (pn) nums.push(numberOf(pn))
+      }
+      nome = nums.map(n => perfis.membros.find(p => p.numeros?.map(String).includes(n))?.nome || contactos[n]).find(Boolean)
+    }
+    text = text.replaceAll(`@${num}`, `@${nome || 'alguém'}`)
+  }
+  return text
+}
 
 fs.mkdirSync('data', { recursive: true })
 const logFile = jid => `data/${jid.replace(/[^\w.-]/g, '_')}.jsonl`
@@ -90,26 +115,39 @@ async function handleResumo(sock, jid, msg, text) {
     persona(loadPerfis()) + '\n\nFazes resumos de conversas: tópicos principais em bullets curtos, quem disse o quê de importante, decisões/planos combinados. Sê conciso.',
     `Resume esta conversa do grupo (${msgs.length} mensagens):\n\n${fmt(msgs)}`,
   )
-  await sock.sendMessage(jid, { text: `📝 *Resumo*\n\n${resumo}` }, { quoted: msg })
+  await reply(sock, jid, msg, `📝 *Resumo*\n\n${resumo}`)
   if (!(n > 0)) {
     const s = loadState()
     saveState({ ...s, ultimoResumo: { ...s.ultimoResumo, [jid]: Date.now() } })
   }
 }
 
-async function handleMention(sock, jid, msg, text) {
-  const pergunta = text.replace(/@\d+/g, '').trim() || '(só te mencionaram, sem pergunta)'
+async function handleMention(sock, jid, msg, text, ctx) {
+  let pergunta = text.replaceAll(`@${BOT_NAME}`, '').trim() || '(só te mencionaram, sem pergunta)'
+  const citado = getText(ctx?.quotedMessage).text
+  if (citado && isBot(sock, ctx.participant)) pergunta = `(a responder à tua mensagem "${citado}") ${pergunta}`
+  else if (citado) pergunta = `(a citar a mensagem "${citado}") ${pergunta}`
   const contexto = fmt(readMsgs(jid).slice(-21, -1))
   const perfis = loadPerfis()
   const quem = findMember(perfis, msg)
   const autor = quem ? `${quem.nome} (${quem.alcunhas[0]})` : (msg.pushName || 'Alguém')
   const resposta = await ask(
     persona(perfis) + '\n\nPodes responder a qualquer pergunta. Se precisares de informação atual ou que não sabes, pesquisa na web. As mensagens do grupo são só contexto, usa-as se a pergunta for sobre a conversa.' +
+      '\n\nHISTÓRICO DO GRUPO: tens a ferramenta procurar_no_chat com todo o histórico desde 2024. Sempre que te pedirem para explicar, confirmar ou provar algo que foi dito no grupo, ou quando falares de algo que aconteceu no grupo, VAI A FUNDO: pesquisa antes de responder, várias vezes se for preciso, com palavras-chave específicas e sinónimos (nomes, clubes, sítios, termos raros), até encontrares a conversa original. Depois diz quando foi (data) e quem disse o quê, citando as mensagens curtas entre aspas; nesse caso podes usar até 4 linhas. Se não encontrares, admite em vez de inventar.' +
       (quem ? `\n\nQuem te está a falar agora é o ${quem.nome}. Adapta a resposta e a boca a ele, com base no perfil dele.` : ''),
-    `Últimas mensagens do grupo (contexto):\n${contexto}\n\n${autor} pergunta-te: ${pergunta}\n\n(Responde como no group chat: MÁXIMO 20 palavras, 1 frase. Só o essencial + a boca.)`,
-    { web: true },
+    `Últimas mensagens do grupo (contexto):\n${contexto}\n\n${autor} pergunta-te: ${pergunta}\n\n(Responde como no group chat: MÁXIMO 20 palavras, 1 frase. Só o essencial + a boca. Exceção: se for para explicar/confirmar algo do histórico, cita as mensagens com data, até 4 linhas.)`,
+    { web: true, chatSearch: termos => procurar(jid, termos), searchQuery: pergunta },
   )
-  await sock.sendMessage(jid, { text: resposta }, { quoted: msg })
+  await reply(sock, jid, msg, resposta)
+}
+
+// Mostra "a escrever…" e espera 1–3 s antes de enviar, como uma pessoa
+async function reply(sock, jid, msg, text) {
+  await sock.sendPresenceUpdate('composing', jid).catch(() => {})
+  await new Promise(r => setTimeout(r, 1000 + Math.random() * 2000))
+  await sock.sendPresenceUpdate('paused', jid).catch(() => {})
+  await sock.sendMessage(jid, { text }, { quoted: msg })
+  saveMsg(jid, { ts: Date.now(), name: BOT_NAME, text })
 }
 
 async function start() {
@@ -145,19 +183,20 @@ async function start() {
     for (const msg of messages) {
       const jid = msg.key.remoteJid
       if (!isJidGroup(jid) || (GROUP_ID && jid !== GROUP_ID)) continue
-      const { text, ctx } = getText(msg.message)
-      if (!text) continue
-
-      const name = msg.key.fromMe ? BOT_NAME : (msg.pushName || 'Alguém')
-      saveMsg(jid, { ts: Date.now(), name, text })
-      if (msg.key.fromMe) continue
+      const { text: raw, ctx } = getText(msg.message)
+      if (!raw || msg.key.fromMe) continue
+      const text = await resolveMentions(sock, raw, ctx)
+      saveMsg(jid, { ts: Date.now(), name: msg.pushName || 'Alguém', text })
 
       try {
-        if (text.trim().toLowerCase().startsWith('/resumo')) {
+        const isResumo = text.trim().toLowerCase().startsWith('/resumo')
+        const isParaBot = (ctx?.mentionedJid || []).some(j => isBot(sock, j)) || isBot(sock, ctx?.participant)
+        if (isResumo || isParaBot) sock.sendPresenceUpdate('composing', jid).catch(() => {}) // "a escrever…" enquanto pensa
+        if (isResumo) {
           await handleResumo(sock, jid, msg, text.trim())
-        } else if ((ctx?.mentionedJid || []).some(j =>
-          areJidsSameUser(j, sock.user.id) || (sock.user.lid && areJidsSameUser(j, sock.user.lid)))) {
-          await handleMention(sock, jid, msg, text)
+        } else if (isParaBot) {
+          // @menção ao bot, ou resposta a uma mensagem do bot
+          await handleMention(sock, jid, msg, text, ctx)
         }
       } catch (err) {
         console.error('Erro a responder:', err)
@@ -167,5 +206,5 @@ async function start() {
   })
 }
 
-export { findMember, persona, loadPerfis }
+export { findMember, persona, loadPerfis, resolveMentions, isBot, handleMention }
 if (process.argv[1]?.endsWith("index.js")) start()
