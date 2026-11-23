@@ -3,3 +3,5 @@ node_modules/
 auth/
 data/
 state.json
+_chat.txt
+perfis.json

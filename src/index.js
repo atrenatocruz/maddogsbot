@@ -10,9 +10,46 @@ import { ask, loadState, saveState } from './ai.js'
 
 const GROUP_ID = process.env.GROUP_ID || ''
 const BOT_NAME = process.env.BOT_NAME || 'Bot'
-const PERSONA = process.env.PERSONA ||
+const DEFAULT_PERSONA =
   `És o ${BOT_NAME}, um bot num grupo de WhatsApp de amigos. Respondes em português de Portugal, de forma curta, direta e informal. Sem markdown pesado (o WhatsApp só suporta *negrito* e _itálico_).`
 const DAY = 24 * 60 * 60 * 1000
+
+// perfis.json é lido a cada mensagem, para poderes editá-lo sem reiniciar
+function loadPerfis() {
+  try { return JSON.parse(fs.readFileSync('perfis.json', 'utf8')) } catch { return { membros: [] } }
+}
+function persona(perfis) {
+  if (!perfis.persona) return DEFAULT_PERSONA
+  const membros = perfis.membros.map(m => `- ${m.nome} (${m.alcunhas.join(', ')}): ${m.perfil}`).join('\n')
+  return `${perfis.persona}\n\nMembros do grupo:\n${membros}`
+}
+
+const norm = s => (s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase()
+const numberOf = jid => (jid || '').split('@')[0].split(':')[0]
+
+// Descobre quem é: 1) número já conhecido, 2) nome do WhatsApp (e memoriza o número)
+function findMember(perfis, msg) {
+  const num = numberOf(msg.key.participantAlt || msg.key.participant)
+  let m = perfis.membros.find(p => p.numeros?.includes(num))
+  const contactos = readJson('data/contactos.json')
+  if (!m && contactos[num]) m = perfis.membros.find(p => p.nome === contactos[num])
+  if (m) return m
+
+  const tokens = norm(msg.pushName).split(/\s+/).filter(Boolean)
+  const scored = perfis.membros.map(p => {
+    const known = new Set([...norm(p.nome).split(/\s+/), ...p.alcunhas.map(norm)])
+    return { p, score: tokens.filter(t => known.has(t)).length }
+  }).sort((a, b) => b.score - a.score)
+  if (scored[0]?.score > 0 && scored[0].score !== scored[1]?.score) {
+    m = scored[0].p
+    fs.writeFileSync('data/contactos.json', JSON.stringify({ ...contactos, [num]: m.nome }, null, 2))
+    console.log(`[perfis] ${msg.pushName} (${num}) → ${m.nome}`)
+  } else {
+    console.log(`[perfis] não reconheci ${msg.pushName} (${num}) — põe o número em "numeros" no perfis.json`)
+  }
+  return m
+}
+function readJson(f) { try { return JSON.parse(fs.readFileSync(f, 'utf8')) } catch { return {} } }
 
 fs.mkdirSync('data', { recursive: true })
 const logFile = jid => `data/${jid.replace(/[^\w.-]/g, '_')}.jsonl`
@@ -50,7 +87,7 @@ async function handleResumo(sock, jid, msg, text) {
     return sock.sendMessage(jid, { text: 'Não há mensagens novas para resumir.' }, { quoted: msg })
   }
   const resumo = await ask(
-    PERSONA + ' Fazes resumos de conversas: tópicos principais em bullets curtos, quem disse o quê de importante, decisões/planos combinados. Sê conciso.',
+    persona(loadPerfis()) + '\n\nFazes resumos de conversas: tópicos principais em bullets curtos, quem disse o quê de importante, decisões/planos combinados. Sê conciso.',
     `Resume esta conversa do grupo (${msgs.length} mensagens):\n\n${fmt(msgs)}`,
   )
   await sock.sendMessage(jid, { text: `📝 *Resumo*\n\n${resumo}` }, { quoted: msg })
@@ -63,9 +100,13 @@ async function handleResumo(sock, jid, msg, text) {
 async function handleMention(sock, jid, msg, text) {
   const pergunta = text.replace(/@\d+/g, '').trim() || '(só te mencionaram, sem pergunta)'
   const contexto = fmt(readMsgs(jid).slice(-21, -1))
+  const perfis = loadPerfis()
+  const quem = findMember(perfis, msg)
+  const autor = quem ? `${quem.nome} (${quem.alcunhas[0]})` : (msg.pushName || 'Alguém')
   const resposta = await ask(
-    PERSONA + ' Podes responder a qualquer pergunta. Se precisares de informação atual ou que não sabes, pesquisa na web. As mensagens do grupo são só contexto, usa-as se a pergunta for sobre a conversa.',
-    `Últimas mensagens do grupo (contexto):\n${contexto}\n\n${msg.pushName || 'Alguém'} pergunta-te: ${pergunta}`,
+    persona(perfis) + '\n\nPodes responder a qualquer pergunta. Se precisares de informação atual ou que não sabes, pesquisa na web. As mensagens do grupo são só contexto, usa-as se a pergunta for sobre a conversa.' +
+      (quem ? `\n\nQuem te está a falar agora é o ${quem.nome}. Adapta a resposta e a boca a ele, com base no perfil dele.` : ''),
+    `Últimas mensagens do grupo (contexto):\n${contexto}\n\n${autor} pergunta-te: ${pergunta}\n\n(Responde como no group chat: MÁXIMO 20 palavras, 1 frase. Só o essencial + a boca.)`,
     { web: true },
   )
   await sock.sendMessage(jid, { text: resposta }, { quoted: msg })
@@ -126,4 +167,5 @@ async function start() {
   })
 }
 
-start()
+export { findMember, persona, loadPerfis }
+if (process.argv[1]?.endsWith("index.js")) start()
